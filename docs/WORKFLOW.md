@@ -23,12 +23,14 @@ scanning GPU module. Any mismatch or CUDA error fails the probe.
 Upstream also supplies a library initialization check:
 
 ```powershell
-& (Join-Path $zluda 'zluda.exe') -- (Join-Path $zluda 'cuda_check.exe')
+./diagnostics/Start-RevoTrace.ps1 -CheckLibraries
 ```
 
-The upstream check's exit code can be zero alongside individual library
-errors. Read the per-library results. The wrapper for Revo Metro below
-handles executable paths and mode selection.
+This checks only the CUDA Driver and cuFFT 11. An unrestricted
+`cuda_check.exe` run also probes cuDNN and can show a missing
+`MIOpen.dll` dialog with the official AMD HIP SDK. The upstream check's
+exit code can be zero alongside individual library errors. Read the
+per-library results.
 
 ## Scanner runs
 

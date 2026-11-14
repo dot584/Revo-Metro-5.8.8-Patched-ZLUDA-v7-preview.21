@@ -25,6 +25,9 @@
   SDK 6.2 libraries. cuBLAS, cuBLASLt, and cuDNN initialization failed.
   The NVAPI entry reported that its check is unimplemented. None of
   those failed libraries appeared in Revo Metro's static CUDA imports.
+  The all-library check can display a missing `MIOpen.dll` dialog
+  while probing cuDNN. The project workflow now restricts the check to
+  `nvcuda` and `cufft11`.
 - Synthetic CUDA Driver API PTX compute passed on the RX 7900 XT,
   matching 257/257 expected integers. An out-of-place complex 2D forward
   cuFFT transform passed 32/32 outputs within absolute error 1e-5.
