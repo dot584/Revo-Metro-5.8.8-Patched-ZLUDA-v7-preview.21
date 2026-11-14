@@ -15,6 +15,11 @@ These patches target ZLUDA v7-preview.21
 - `0004-windows-cargo-build.patch` handles the new Cargo build directory
   layout, preserves LLVM include paths with spaces, and disables LLVM's
   optional Windows DIA SDK dependency.
+- `0005-normalize-legacy-stream-handle.patch` maps CUDA's explicit
+  `CU_STREAM_LEGACY` (`0x1`) handle to HIP's null/default stream (`0x0`)
+  when converting `CUstream` to `hipStream_t`, avoiding HIP 6.2's
+  invalid dereference of `0x1` while preserving legacy default-stream
+  synchronization semantics. Exercise it with `tests/gpu_smoke.py`.
 
 Apply the patches in numeric order to a development checkout, then
 build using [the project workflow](../docs/WORKFLOW.md#patched-windows-driver).

@@ -1,0 +1,102 @@
+diff --git a/zluda_common/src/lib.rs b/zluda_common/src/lib.rs
+index ec2d9d2..4132c27 100644
+--- a/zluda_common/src/lib.rs
++++ b/zluda_common/src/lib.rs
+@@ -139,16 +139,9 @@ macro_rules! from_cuda_nop {
+     };
+ }
+ 
+-macro_rules! from_cuda_transmute {
++macro_rules! from_cuda_transmute_ptr {
+     ($($from:ty => $to:ty),*) => {
+         $(
+-            #[cfg(target_pointer_width = "64")]
+-            impl<'a, E: CudaErrorType> FromCuda<'a, $from, E> for $to {
+-                fn from_cuda(x: &'a $from) -> Result<Self, E> {
+-                    Ok(unsafe { std::mem::transmute(*x) })
+-                }
+-            }
+-
+             impl<'a, E: CudaErrorType> FromCuda<'a, *mut $from, E> for &'a mut $to {
+                 fn from_cuda(x: &'a *mut $from) -> Result<Self, E> {
+                     match unsafe { x.cast::<$to>().as_mut() } {
+@@ -188,6 +181,21 @@ macro_rules! from_cuda_transmute {
+     };
+ }
+ 
++macro_rules! from_cuda_transmute {
++    ($($from:ty => $to:ty),*) => {
++        $(
++            #[cfg(target_pointer_width = "64")]
++            impl<'a, E: CudaErrorType> FromCuda<'a, $from, E> for $to {
++                fn from_cuda(x: &'a $from) -> Result<Self, E> {
++                    Ok(unsafe { std::mem::transmute(*x) })
++                }
++            }
++
++            from_cuda_transmute_ptr!($from => $to);
++        )*
++    };
++}
++
+ /// Implement the [`FromCuda`] trait for a [`ZludaObject`].
+ #[macro_export]
+ macro_rules! from_cuda_object {
+@@ -286,7 +294,6 @@ from_cuda_nop!(
+ );
+ from_cuda_transmute!(
+     CUuuid => hipUUID,
+-    CUstream => hipStream_t,
+     CUpointer_attribute => hipPointer_attribute,
+     CUdeviceptr_v2 => hipDeviceptr_t,
+     CUevent => hipEvent_t,
+@@ -328,6 +335,21 @@ from_cuda_transmute!(
+     CUgraphicsResource => hipGraphicsResource_t
+ );
+ 
++const CU_STREAM_LEGACY_RAW: usize = 0x1;
++
++#[cfg(target_pointer_width = "64")]
++impl<'a, E: CudaErrorType> FromCuda<'a, CUstream, E> for hipStream_t {
++    fn from_cuda(x: &'a CUstream) -> Result<Self, E> {
++        if x.0 as usize == CU_STREAM_LEGACY_RAW {
++            Ok(hipStream_t(ptr::null_mut()))
++        } else {
++            Ok(unsafe { std::mem::transmute(*x) })
++        }
++    }
++}
++
++from_cuda_transmute_ptr!(CUstream => hipStream_t);
++
+ impl<'a, E: CudaErrorType> FromCuda<'a, *const CUDA_MEMCPY3D, E> for HIP_MEMCPY3D {
+     fn from_cuda(memcpy: &'a *const CUDA_MEMCPY3D) -> Result<Self, E> {
+         let memcpy = unsafe { memcpy.as_ref() }.ok_or(E::INVALID_VALUE)?;
+@@ -1277,3 +1299,27 @@ pub enum CodeModuleRef<'a> {
+     Elf(*const c_void),
+     Archive(*const c_void),
+ }
++
++#[cfg(all(test, target_pointer_width = "64"))]
++mod stream_conversion_tests {
++    use super::*;
++
++    #[test]
++    fn maps_legacy_stream_to_null_hip_stream_and_preserves_other_handles() {
++        let null_stream = CUstream(ptr::null_mut());
++        let legacy_stream = CUstream(CU_STREAM_LEGACY_RAW as *mut CUstream_st);
++        let per_thread_stream = CUstream(0x2 as *mut CUstream_st);
++        let custom_stream = CUstream(0x1234_5678 as *mut CUstream_st);
++
++        let hip_null: hipStream_t = FromCuda::<_, CUerror>::from_cuda(&null_stream).unwrap();
++        let hip_legacy: hipStream_t = FromCuda::<_, CUerror>::from_cuda(&legacy_stream).unwrap();
++        let hip_per_thread: hipStream_t =
++            FromCuda::<_, CUerror>::from_cuda(&per_thread_stream).unwrap();
++        let hip_custom: hipStream_t = FromCuda::<_, CUerror>::from_cuda(&custom_stream).unwrap();
++
++        assert!(hip_null.0.is_null());
++        assert!(hip_legacy.0.is_null());
++        assert_eq!(hip_per_thread.0 as usize, 0x2);
++        assert_eq!(hip_custom.0 as usize, 0x1234_5678);
++    }
++}

@@ -1,4 +1,8 @@
 /artifacts/
 /logs/
 /upstream/ZLUDA/
+/Test Scans/
+/Test Scan*/
+/skills/
 __pycache__/
+*.dmp

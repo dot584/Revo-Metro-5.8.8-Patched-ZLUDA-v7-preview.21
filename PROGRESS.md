@@ -99,3 +99,169 @@ the two CUDA gaps are being addressed.
   Launch it via `Start-RevoTrace.ps1 -ZludaDir` and repeat the same
   new-project Save and scanner-start sequence. Physical scanning,
   tracking, and accuracy remain to be tested.
+
+### Patched scanner retest
+
+- Revo Metro advanced further into loading on the patched build.
+  The previously missing Thrust lookup returned `CUDA_SUCCESS` with a
+  non-null handle. The trace ended there and the app exited with
+  `0xC0000005`. The trace records completed calls, so a fault during
+  the next call or in the application remains possible.
+- The run produced 20 distinct PTX dumps and 20 ELF dumps. No matching
+  Windows application event or user crash dump surfaced. Next capture
+  the first-chance native access violation and inspect its stack before
+  selecting another compatibility change.
+
+### Explicit legacy stream handle normalization
+
+- A native crash dump from the next Revo Metro 5.8.8.460 startup run
+  (`logs/revo-trace-20261113-215041-514`) recorded an access violation in
+  AMD HIP 6.2 at `amdhip64_6.dll+0x2F8960` (`mov eax, [rcx+0x270]` with
+  `RCX=0x1`, reading `0x271`). Passing the explicit CUDA legacy default
+  stream sentinel `CU_STREAM_LEGACY` (`0x1`) to `cuLaunchKernel` on the
+  RX 7900 XT reproduced the same invalid read.
+- Disassembly of `amdhip64_6.dll` showed that while `hip::getStream`
+  routes both `nullptr` (`0x0`) and `hipStreamLegacy` (`0x1`) to
+  `Device::GetNullStream(wait = true)` (which synchronizes bidirectionally
+  with blocking streams via `Device::AddSafeStreams`), HIP 6.2's
+  `STREAM_CAPTURE` prologue in `hipModuleLaunchKernel`,
+  `ihipGetStreamDeviceId` in `ihipModuleLaunchKernel`, and
+  `ihipStreamSynchronize` omit the `stream != hipStreamLegacy` guard and
+  dereference `0x1` as a `hip::Stream*` pointer. `ihipStreamSynchronize`
+  also checks `stream == nullptr` when deciding whether to drain blocking
+  streams.
+- Added `patches/0005-normalize-legacy-stream-handle.patch` in
+  `zluda_common/src/lib.rs` so `FromCuda<'a, CUstream, E> for hipStream_t`
+  normalizes `CU_STREAM_LEGACY` (`0x1`) to `hipStream_t(ptr::null_mut())`
+  (`0x0`) while preserving `0x0`, `CU_STREAM_PER_THREAD` (`0x2`), and
+  explicit `hipStream_t` pointers, and retaining pointer conversions via
+  `from_cuda_transmute_ptr!(CUstream => hipStream_t)`.
+- Extended `tests/gpu_smoke.py` with a stream regression covering
+  `cuLaunchKernel`, `cuLaunchKernelEx`, async HtoD/DtoH copies,
+  `cuMemsetD32Async`, `cuEventRecord`, `cuStreamWaitEvent`,
+  `cuStreamSynchronize`, and `cuStreamQuery` across null (`0x0`),
+  explicit legacy (`0x1`), per-thread (`0x2`), blocking, and non-blocking
+  streams, plus bidirectional legacy default-stream synchronization with
+  blocking streams.
+- Rebuilt and staged `artifacts/zluda-patched-20261113-222905-143`.
+  `zluda_common` unit tests, the PTX compute probe (257/257), the stream
+  and legacy-synchronization regression, cuFFT 11 (32/32), shared/global
+  unsigned atomic reduction (16,640), fatbin multi-member lookup and
+  cross-member device call (79), and traced stream execution all passed on
+  the RX 7900 XT (`gfx1100`).
+- Next experiment is to launch Revo Metro 5.8.8.460 against
+  `artifacts/zluda-patched-20261113-222905-143` with
+  `diagnostics/Start-RevoTrace.ps1 -CaptureCrash` and test whether
+  scanning startup completes past the Thrust kernel launch. Marker
+  recognition, sustained tracking, and CPU/GPU accuracy remain untested
+  until physical scanner runs complete.
+
+### First physical scan on patched driver (no crash; tracking/surface gap)
+
+- Launched Revo Metro 5.8.8.460 with `diagnostics/Start-RevoTrace.ps1`
+  against `artifacts/zluda-patched-20261113-222905-143`
+  (`logs/revo-trace-20261113-223643-315`). Project loading and scan
+  startup succeeded with zero crashes (`RevoMetro.exe` exited cleanly with
+  code `0`; no `RevoMetro-crash.dmp` generated).
+- Observed in the physical scan: Revo Metro detected reflective dots,
+  struggled with tracking, and recorded only small bits of noise instead
+  of scanning the object surface. The user also noted GPU utilization
+  remained around 25%.
+- Trace analysis of `logs/revo-trace-20261113-223643-315/RevoMetro.exe/log.txt`
+  (62.4 MB, 467,499 lines) showed:
+  - `cuLibraryLoadData` compiled the 5-member fatbin cleanly.
+  - All 103,452 `cuLaunchKernel` calls across 1,815 stereo frames
+    (3,630 images) returned `CUDA_SUCCESS`, with zero post-init CUDA errors.
+  - Stage 3 (`GpuStereoMatch`) returned 57 to 18,194 3D points per frame
+    (median 5,709 points/frame via `cuMemcpyDtoHAsync_v2` on `0x3089c0000`),
+    indicating the pipeline is producing point output rather than failing
+    with zero points.
+- Direct RX 7900 XT verification of extracted kernels (from the 5-member
+  fatbin in `log.txt`) passed for `DeviceRadixSortSingleTileKernel` (8 and
+  268 items), the Connected Components Labeling pipeline, `.const` symbol
+  updates (`k_camera_q`), `FailedResultMatchKernelH`, Thrust
+  `__fill7functor<FailedGroup>`, `StatGroupsKernel`, and
+  `FindMajorIdKernel`.
+- Read-only inspection of `RPAGPUAlgorithm.dll` showed:
+  - `Impl::Run2` executes Stage 1 (`GpuPreprocess`), Stage 2
+    (`GpuExtractFeature`), and Stage 3 (`GpuStereoMatch`) sequentially and
+    copies `3 * count` floats back to host.
+  - `RPAGPUAlgorithm.dll` also includes a built-in Vulkan backend
+    (`ComputeBackend == 2` alongside CUDA `== 1`) and built-in stage
+    debug dump hooks.
+  - `cuModuleGetGlobal_v2` resolves `.const` symbol buffers
+    (`c_steger_kernel`, `c_gather_steger_kernel`, `k_segment_param_left`,
+    `k_segment_param_right`, `k_camera_pl`, `k_camera_pr`, `k_camera_q`).
+- Note on tracing overhead: running `Start-RevoTrace.ps1` without
+  `-NoTrace` logs ~260 synchronous Driver API calls per stereo frame to
+  `log.txt` (467,499 lines / 59.56 MB in `logs/revo-trace-20261113-223643-315`),
+  throttling GPU throughput (~25% GPU utilization) and real-time frame rate.
+- Stage 1 / 2 / 3 RX 7900 XT kernel verification against `artifacts/zluda-patched-20261113-222905-143`:
+  - Stage 1: `RemapKernel`, `real2complex` + `fftshift2D` + `applyFilter` +
+    `ifftshift2D` + `extractReal` + `normalizeKernel`, `ErodeKernel`,
+    `ComputeIntegralRowKernel` + `ComputeIntegralColKernel` +
+    `AdaptiveThreshIntegralKernel`, `GetGrayMaxInRowKernel` (`red.global.add.u32`),
+    and `cufft64_11.dll` `cufftPlan2d(1200, 1600, CUFFT_C2C)` roundtrip all
+    passed against CPU reference expectations.
+  - Stage 2: `StegerKernel` (`c_steger_kernel` `.const` update) and
+    `GatherKernel` (`atom.global.add.u32`) passed.
+  - Stage 3: `SearchMapKernelH`, `PointToPointSecondMatchKernelH` (with
+    register-indirect `.const` `k_segment_param_left` / `k_segment_param_right`
+    loads), and `ArrangeAndCombineSecondMatchKernel` (`6480`-byte `.local`
+    frame + `st.local.v2`) all passed.
+- Next step: run a physical scan with `diagnostics/Start-RevoTrace.ps1 -NoTrace`
+  (removing `trace/nvcuda.dll` synchronous per-call file I/O) to see whether
+  marker tracking and surface capture work cleanly at full frame rate, or if
+  an issue remains when untraced.
+
+## Matched untraced CPU vs GPU scan (`Test Scan 1`)
+
+- User ran an untraced ZLUDA GPU scan (`4fb8956c-50ea-4e9a-8aff-aa9339da89c5`)
+  and a matched CPU scan (`43f56096-edaa-4143-8013-6911c8b62473`) in
+  `Test Scan 1/Test Scan 1/data/`.
+- Comparison of the two scans:
+  - `raw_preview.ply`: **202,219** finite vertices (0 NaN/Inf/zero) on GPU vs
+    **216,959** on CPU. Both reconstructed the vase and turntable geometry.
+  - `property.rvproj`: `vf_count` **1,705** (GPU) vs **2,012** (CPU).
+  - `marker_framework.mkf`: **75** markers (GPU) vs **74** markers (CPU).
+  - `preview.png`: GPU scan has sparser/missing patches on the flat
+    turntable around the base of the vase and slightly more stray outliers.
+  - `process.log`: GPU logged `Error: Matrix4x4::operator = right matrix is empty`
+    (CPU `process.log` is empty), indicating intermittent tracking-pose loss.
+- Additional RX 7900 XT checks:
+  - `cufftPlan2d(12, 16, CUFFT_C2C)` forward DFT matched exact row-major 2D
+    DFT peaks; `800x600` CCL with `32x32` (1024-thread) blocks returned exact
+    component count (`40 / 40`).
+  - `1600x1200` kernel timings (`RemapKernel` 0.067 ms, `applyFilter` 0.372 ms,
+    `StegerKernel` 0.032 ms, `ArrangeAndCombineSecondMatchKernel` 0.648 ms)
+    plus `alloc+memset+4xcufft+sync` (1.09 ms/frame) show raw GPU compute is
+    not the bottleneck.
+  - `StegerKernel` passed across vertical (`1234` hits), horizontal (`1234`
+    hits), and 45-degree diagonal (`1336` hits) Gaussian stripes, and the
+    end-to-end `1600x1200` FFT bandpass pipeline matched bright (`220`) and
+    dim (`40`) stripe profiles.
+- High-quality fusion and meshing on `Test Scan 1` (`logs/revo-trace-mesh`):
+  - Only `4` startup `cuLaunchKernel` calls appeared in
+    `logs/revo-trace-mesh/RevoMetro.exe/log.txt` (76 KB), confirming fusion
+    and meshing do not use CUDA.
+  - GPU scan fused/meshed cleanly (`fuse.ply`: 787,509 points at 0.24 mm
+    pitch; `fuse_mesh.ply`: 1,171,098 vertices / 2,307,092 faces; `mark.ply`:
+    83 markers) alongside CPU (`fuse.ply`: 260,808 points at 0.51 mm pitch;
+    `fuse_mesh.ply`: 497,616 vertices / 977,994 faces; `mark.ply`: 84 markers).
+- VRAM & per-frame GPU/WDDM overhead audit:
+  - `cuDeviceTotalMem_v2` reports `21,458,059,264` bytes (~20 GB) to `RevoMetro.exe`,
+    so the RX 7900 XT VRAM is detected properly.
+  - Cumulative `cuMemAlloc_v2` across 1,815 traced frames was `866.9 MB` (single
+    stereo frame buffers + small 140–1,409 B per-frame scratch allocations);
+    Revo Metro copies 3D points back to host RAM per frame and runs fusion/meshing
+    on CPU/RAM/disk, so 20 GB VRAM does not increase maximum fused/meshed scan size.
+  - Realistic 6,000-point Stage 3 kernel timings on RX 7900 XT:
+    `SearchMapKernelH` (`0.152 ms` left + `0.175 ms` right),
+    `PointToPointSecondMatchKernelH` (`0.014 ms`),
+    `ArrangeAndCombineSecondMatchKernel` (`0.622 ms`).
+  - Per-frame ZLUDA/WDDM API overhead replay (`2x cuMemAlloc_v2(140)+cuMemFree_v2`:
+    `0.134 ms`, `5x cuMemcpyDtoH_v2(4B)`: `0.220 ms`, `8x cuCtxSynchronize`: `0.003 ms`,
+    `4x cuStreamSynchronize`: `0.001 ms`, `42x cuMemsetD8_v2(1.92 MB)`: `0.158 ms`)
+    totals `0.517 ms/frame`. Combined with Stage 1–3 kernels and 4x `cufftExecC2C`,
+    total GPU pipeline time is ~2.5 ms/frame (~400 FPS theoretical), so ZLUDA/GPU
+    compute is not bottlenecking scanner frame rate.

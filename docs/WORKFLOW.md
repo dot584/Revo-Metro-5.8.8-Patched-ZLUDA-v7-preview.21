@@ -134,3 +134,9 @@ kernel, and an actual cross-image device call. After both probes pass,
 use `./diagnostics/Start-RevoTrace.ps1 -ZludaDir $patched` for the scanner
 retest. The launcher uses the installed Revo Metro executable and the
 DLLs in the staged project package.
+
+For a silent access violation, add `-CaptureCrash` to that command.
+The launcher uses Microsoft-signed [ProcDump](https://learn.microsoft.com/en-us/sysinternals/downloads/procdump)
+at `artifacts/procdump/procdump64.exe` and captures one unhandled
+exception. The minidump and CUDA trace share the printed session folder.
+Keep the dump local and report the session folder name.

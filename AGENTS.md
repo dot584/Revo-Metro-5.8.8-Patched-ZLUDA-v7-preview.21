@@ -7,3 +7,4 @@
 - Use matched CPU/GPU scanner runs before making claims about marker recognition, tracking, or accuracy. The user operates the scanner.
 - Ask before installing or changing system drivers, changing system configuration, or editing files outside this workspace.
 - Update PROGRESS.md after meaningful milestones with exact versions, observed results, remaining uncertainties, and the next experiment.
+- Before starting a major project change, read [MILESTONES.md](MILESTONES.md) for the latest handoff. Complete the work and its checks, then append a short entry there using the file's template. Record meaningful partial work and its blocker if the task cannot be finished.
