@@ -1,6 +1,8 @@
+diff --git a/ptx_parser/src/ast.rs b/ptx_parser/src/ast.rs
+index ca0a2c6..d1bf2f8 100644
 --- a/ptx_parser/src/ast.rs
 +++ b/ptx_parser/src/ast.rs
-@@ -100,7 +100,7 @@
+@@ -100,7 +100,7 @@ ptx_parser_macros::generate_instruction_type!(
              type: &data.type_,
              data: AtomDetails,
              arguments<T>: {
@@ -9,25 +11,66 @@
                  src1: {
                      repr: T,
                      space: { data.space },
+diff --git a/ptx_parser/src/lib.rs b/ptx_parser/src/lib.rs
+index 16ec787..f9a475f 100644
 --- a/ptx_parser/src/lib.rs
 +++ b/ptx_parser/src/lib.rs
-@@ -3587,9 +3587,25 @@
+@@ -3587,7 +3587,7 @@ derive_parser!(
                  op: ast::AtomicOp::new(op, type_.kind()),
                  type_: type_.into()
              },
 -            arguments: AtomArgs { dst: d, src1: a, src2: b }
--        }
--    }
 +            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
-+        }
-+    }
+         }
+     }
+     atom{.sem}{.scope}{.space}.cas.cas_type                                                     d, [a], b, c => {
+@@ -3613,7 +3613,7 @@ derive_parser!(
+                 op: ast::AtomicOp::new(exch, b128.kind()),
+                 type_: b128.into()
+             },
+-            arguments: AtomArgs { dst: d, src1: a, src2: b }
++            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
+         }
+     }
+     atom{.sem}{.scope}{.global}.float_op{.level::cache_hint}.vec_32_bit.f32                     d, [a], b{, cache_policy} => {
+@@ -3628,7 +3628,7 @@ derive_parser!(
+                 op: ast::AtomicOp::new(float_op, f32.kind()),
+                 type_: ast::Type::Vector(vec_32_bit.len().get(), f32)
+             },
+-            arguments: AtomArgs { dst: d, src1: a, src2: b }
++            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
+         }
+     }
+     atom{.sem}{.scope}{.global}.float_op.noftz{.level::cache_hint}{.vec_16_bit}.half_word_type  d, [a], b{, cache_policy} => {
+@@ -3643,7 +3643,7 @@ derive_parser!(
+                 op: ast::AtomicOp::new(float_op, half_word_type.kind()),
+                 type_: ast::Type::maybe_vector(vec_16_bit, half_word_type)
+             },
+-            arguments: AtomArgs { dst: d, src1: a, src2: b }
++            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
+         }
+     }
+     atom{.sem}{.scope}{.global}.float_op.noftz{.level::cache_hint}{.vec_32_bit}.packed_type     d, [a], b{, cache_policy} => {
+@@ -3658,7 +3658,7 @@ derive_parser!(
+                 op: ast::AtomicOp::new(float_op, packed_type.kind()),
+                 type_: ast::Type::maybe_vector(vec_32_bit, packed_type)
+             },
+-            arguments: AtomArgs { dst: d, src1: a, src2: b }
++            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
+         }
+     }
+     .space: StateSpace =            { .global, .shared{::cta, ::cluster} };
+@@ -3680,6 +3680,24 @@ derive_parser!(
+     StateSpace =                    { .global };
+     RawAtomicOp =                   { .exch };
+ 
 +    // Scalar unsigned reductions use the same atomic memory operation as atom,
 +    // with no destination for the old value.
-+    red{.red_sem}{.scope}{.red_space}.add.u32 [a], b => {
++    red{.red_sem}{.red_scope}{.red_space}.add.u32 [a], b => {
 +        ast::Instruction::Atom {
 +            data: AtomDetails {
 +                semantics: red_sem.unwrap_or(AtomSemantics::Relaxed),
-+                scope: scope.unwrap_or(MemScope::Gpu),
++                scope: red_scope.unwrap_or(MemScope::Gpu),
 +                space: red_space.unwrap_or(StateSpace::Generic),
 +                op: ast::AtomicOp::Add,
 +                type_: ScalarType::U32.into()
@@ -37,53 +80,78 @@
 +    }
 +    .red_sem: AtomSemantics = { .relaxed, .release };
 +    .red_space: StateSpace = { .global, .shared{::cta, ::cluster} };
-     atom{.sem}{.scope}{.space}.cas.cas_type                                                     d, [a], b, c => {
-         ast::Instruction::AtomCas {
-             data: AtomCasDetails {
-@@ -3613,7 +3629,7 @@
-                 op: ast::AtomicOp::new(exch, b128.kind()),
-                 type_: b128.into()
-             },
--            arguments: AtomArgs { dst: d, src1: a, src2: b }
-+            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
-         }
-     }
-     atom{.sem}{.scope}{.global}.float_op{.level::cache_hint}.vec_32_bit.f32                     d, [a], b{, cache_policy} => {
-@@ -3628,7 +3644,7 @@
-                 op: ast::AtomicOp::new(float_op, f32.kind()),
-                 type_: ast::Type::Vector(vec_32_bit.len().get(), f32)
-             },
--            arguments: AtomArgs { dst: d, src1: a, src2: b }
-+            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
-         }
-     }
-     atom{.sem}{.scope}{.global}.float_op.noftz{.level::cache_hint}{.vec_16_bit}.half_word_type  d, [a], b{, cache_policy} => {
-@@ -3643,7 +3659,7 @@
-                 op: ast::AtomicOp::new(float_op, half_word_type.kind()),
-                 type_: ast::Type::maybe_vector(vec_16_bit, half_word_type)
-             },
--            arguments: AtomArgs { dst: d, src1: a, src2: b }
-+            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
-         }
-     }
-     atom{.sem}{.scope}{.global}.float_op.noftz{.level::cache_hint}{.vec_32_bit}.packed_type     d, [a], b{, cache_policy} => {
-@@ -3658,7 +3674,7 @@
-                 op: ast::AtomicOp::new(float_op, packed_type.kind()),
-                 type_: ast::Type::maybe_vector(vec_32_bit, packed_type)
-             },
--            arguments: AtomArgs { dst: d, src1: a, src2: b }
-+            arguments: AtomArgs { dst: Some(d), src1: a, src2: b }
-         }
-     }
-     .space: StateSpace =            { .global, .shared{::cta, ::cluster} };
++    .red_scope: MemScope = { .cta, .cluster, .gpu, .sys };
++
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-div
+     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-div
+     div.type  d, a, b => {
+@@ -4602,6 +4620,46 @@ mod tests {
+     use logos::Span;
+     use winnow::prelude::*;
+ 
++    #[test]
++    fn scalar_atomic_reduction_discards_old_value() {
++        let module = parse_module_checked(
++            ".version 8.4
++             .target sm_86
++             .address_size 64
++             .visible .entry k() {
++                 .reg .u32 %shared_addr;
++                 .reg .u64 %global_addr;
++                 red.shared.add.u32 [%shared_addr], 1;
++                 red.release.gpu.global.add.u32 [%global_addr], 2;
++                 ret;
++             }",
++        )
++        .unwrap();
++        let crate::Directive::Method(_, kernel) = &module.directives[0] else {
++            panic!("expected the kernel directive");
++        };
++        let instructions: Vec<_> = kernel
++            .body
++            .as_ref()
++            .unwrap()
++            .iter()
++            .filter_map(|statement| match statement {
++                crate::Statement::Instruction(_, crate::Instruction::Atom { data, arguments }) => {
++                    Some((data, arguments))
++                }
++                _ => None,
++            })
++            .collect();
++        assert_eq!(instructions.len(), 2);
++        assert!(instructions.iter().all(|(_, args)| args.dst.is_none()));
++        assert!(matches!(instructions[0].0.space, crate::StateSpace::Shared));
++        assert!(matches!(instructions[1].0.space, crate::StateSpace::Global));
++        assert!(matches!(
++            instructions[1].0.semantics,
++            crate::AtomSemantics::Release
++        ));
++    }
++
+     #[test]
+     fn sink_is_not_an_identifier() {
+         let tokens = Token::lexer("_ _reg __ %r1")
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index 079a801..a8eba31 100644
 --- a/ptx/src/pass/llvm/emit.rs
 +++ b/ptx/src/pass/llvm/emit.rs
-@@ -1351,7 +1351,7 @@
+@@ -1351,15 +1383,9 @@ impl<'a> MethodEmitContext<'a> {
              ast::AtomicOp::FloatMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMin,
              ast::AtomicOp::FloatMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMax,
          };
 -        self.resolver.register(arguments.dst, unsafe {
+-            LLVMZludaBuildAtomicRMW(
+-                builder,
+-                op,
+-                src1,
+-                src2,
+-                get_scope(data.scope)?,
+-                get_ordering(data.semantics),
+-            )
++        let scope = get_scope(data.scope)?;
 +        self.resolver.with_result_option(arguments.dst, |_| unsafe {
-             LLVMZludaBuildAtomicRMW(
-                 builder,
-                 op,
++            LLVMZludaBuildAtomicRMW(builder, op, src1, src2, scope, get_ordering(data.semantics))
+         });
+         Ok(())
+     }

@@ -1,0 +1,597 @@
+diff --git a/llvm_zluda/src/utils.rs b/llvm_zluda/src/utils.rs
+index b0a2e26..0c93354 100644
+--- a/llvm_zluda/src/utils.rs
++++ b/llvm_zluda/src/utils.rs
+@@ -112,6 +112,43 @@ impl Module {
+         }
+     }
+ 
++    pub fn link_ptx_member(&self, other: Module) -> Result<(), String> {
++        // LLVM's default handler can terminate the host process on a link error.
++        extern "C" fn record_diagnostic(
++            diagnostic: LLVMDiagnosticInfoRef,
++            context: *mut std::ffi::c_void,
++        ) {
++            unsafe {
++                let message = LLVMGetDiagInfoDescription(diagnostic);
++                let output = &mut *context.cast::<String>();
++                output.push_str(&CStr::from_ptr(message).to_string_lossy());
++                output.push('\n');
++                LLVMDisposeMessage(message);
++            }
++        }
++
++        let context = unsafe { LLVMGetModuleContext(self.get()) };
++        let handler = unsafe { LLVMContextGetDiagnosticHandler(context) };
++        let handler_context = unsafe { LLVMContextGetDiagnosticContext(context) };
++        let mut diagnostic = String::new();
++        unsafe {
++            LLVMContextSetDiagnosticHandler(
++                context,
++                Some(record_diagnostic),
++                std::ptr::from_mut(&mut diagnostic).cast(),
++            );
++        }
++        let result = self.link(other);
++        unsafe { LLVMContextSetDiagnosticHandler(context, handler, handler_context) };
++        result.map_err(|error| {
++            if diagnostic.is_empty() {
++                error.into()
++            } else {
++                diagnostic
++            }
++        })
++    }
++
+     fn into_raw(self) -> LLVMModuleRef {
+         let ptr = self.0;
+         mem::forget(self);
+diff --git a/ptx/src/lib.rs b/ptx/src/lib.rs
+index 8daa637..f8c9fb7 100644
+--- a/ptx/src/lib.rs
++++ b/ptx/src/lib.rs
+@@ -2,6 +2,7 @@ pub(crate) mod pass;
+ #[cfg(test)]
+ mod test;
+ 
++pub use pass::link_ptx_modules;
+ pub use pass::to_llvm_module;
+ pub use pass::Attributes;
+ pub use pass::TranslateError;
+diff --git a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+index 598a8e1..b47ad69 100644
+--- a/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
++++ b/ptx/src/pass/instruction_mode_to_global_mode/mod.rs
+@@ -646,7 +646,15 @@ pub(crate) fn run<'input>(
+     flat_resolver: &mut GlobalStringIdentResolver2<'input>,
+     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+ ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
+-    let cfg = create_control_flow_graph(&directives)?;
++    run_with_external_entries(flat_resolver, directives, false)
++}
++
++pub(crate) fn run_with_external_entries<'input>(
++    flat_resolver: &mut GlobalStringIdentResolver2<'input>,
++    directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
++    for_linking: bool,
++) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
++    let cfg = create_control_flow_graph(flat_resolver, &directives, for_linking)?;
+     let (denormal_f32, denormal_f16f64, rounding_f32, rounding_f16f64) =
+         compute_minimal_mode_insertions(&cfg)?;
+     let temp = compute_full_mode_insertions(
+@@ -745,7 +753,9 @@ fn compute_minimal_mode_insertions(
+ // This function creates control flow graph for the whole module. This control
+ // flow graph expresses function calls as edges in the control flow graph
+ fn create_control_flow_graph(
++    resolver: &mut GlobalStringIdentResolver2,
+     directives: &Vec<Directive2<ptx_parser::Instruction<SpirvWord>, SpirvWord>>,
++    for_linking: bool,
+ ) -> Result<ControlFlowGraph, TranslateError> {
+     let mut cfg = ControlFlowGraph::new();
+     for directive in directives.iter() {
+@@ -754,8 +764,17 @@ fn create_control_flow_graph(
+                 name,
+                 body: Some(body),
+                 kernel_attributes,
++                linkage,
+                 ..
+             }) => {
++                if for_linking
++                    && kernel_attributes.is_none()
++                    && linkage
++                        .intersects(ast::LinkingDirective::VISIBLE | ast::LinkingDirective::WEAK)
++                {
++                    let entry = cfg.add_entry_basic_block(resolver.register_unnamed(None));
++                    cfg.add_jump(entry, *name);
++                }
+                 let (mut bb_state, mut body_iter) =
+                     BasicBlockState::new(&mut cfg, *name, body, kernel_attributes.is_some())?;
+                 while let Some(statement) = body_iter.next() {
+diff --git a/ptx/src/pass/mod.rs b/ptx/src/pass/mod.rs
+index 3ed6e35..04bb5ac 100644
+--- a/ptx/src/pass/mod.rs
++++ b/ptx/src/pass/mod.rs
+@@ -64,9 +64,66 @@ pub struct Attributes {
+ pub fn to_llvm_module<'input>(
+     ast: ast::Module<'input>,
+     attributes: Attributes,
+-    mut on_pass_end: impl FnMut(&str),
++    on_pass_end: impl FnMut(&str),
+ ) -> Result<Module, TranslateError> {
+     let sm_version = ast.sm_version;
++    let context = llvm_zluda::utils::Context::new();
++    let (llvm_ir, metadata32, constrained_fp) = lower_module(&context, ast, false, on_pass_end)?;
++    let attributes_ir = llvm::attributes::run(&context, attributes)?;
++    Ok(Module {
++        llvm_ir,
++        attributes_ir,
++        context,
++        metadata: kernel_metadata::ModuleMetadataV1::new(sm_version),
++        metadata32,
++        constrained_fp,
++    })
++}
++
++pub fn link_ptx_modules(
++    modules: Vec<ast::Module<'_>>,
++    attributes: Attributes,
++) -> Result<Module, TranslateError> {
++    let sm_version = modules
++        .iter()
++        .map(|module| module.sm_version)
++        .max()
++        .unwrap_or(0);
++    let context = llvm_zluda::utils::Context::new();
++    let llvm_ir = llvm_zluda::utils::Module::new(&context, c"fatbin");
++    let mut constrained_fp = false;
++    for module in modules {
++        if module.address_size != 64 {
++            return Err(error_todo_msg("Linking 32-bit PTX libraries"));
++        }
++        let (member, _, member_constrained_fp) = lower_module(&context, module, true, |_| {})?;
++        llvm_ir.link_ptx_member(member).map_err(error_todo_msg)?;
++        constrained_fp |= member_constrained_fp;
++    }
++    let attributes_ir = llvm::attributes::run(&context, attributes)?;
++    Ok(Module {
++        llvm_ir,
++        attributes_ir,
++        context,
++        metadata: kernel_metadata::ModuleMetadataV1::new(sm_version),
++        metadata32: None,
++        constrained_fp,
++    })
++}
++
++fn lower_module<'input>(
++    context: &llvm_zluda::utils::Context,
++    ast: ast::Module<'input>,
++    for_linking: bool,
++    mut on_pass_end: impl FnMut(&str),
++) -> Result<
++    (
++        llvm_zluda::utils::Module,
++        Option<kernel_metadata::ModuleMetadata32Bit>,
++        bool,
++    ),
++    TranslateError,
++> {
+     let mut flat_resolver = GlobalStringIdentResolver2::<'input>::new(SpirvWord(1));
+     let mut scoped_resolver = ScopedResolver::new(&mut flat_resolver);
+     let sreg_map = SpecialRegistersMap::new(&mut scoped_resolver)?;
+@@ -95,9 +152,17 @@ pub fn to_llvm_module<'input>(
+     on_pass_end("replace_instructions_with_functions_fp_required");
+     let directives = normalize_basic_blocks::run(&mut flat_resolver, directives)?;
+     on_pass_end("normalize_basic_blocks");
+-    let directives = remove_unreachable_basic_blocks::run(directives)?;
++    let directives = remove_unreachable_basic_blocks::run(directives, for_linking)?;
+     on_pass_end("remove_unreachable_basic_blocks");
+-    let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
++    let directives = if for_linking {
++        instruction_mode_to_global_mode::run_with_external_entries(
++            &mut flat_resolver,
++            directives,
++            true,
++        )?
++    } else {
++        instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?
++    };
+     on_pass_end("instruction_mode_to_global_mode");
+     let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
+     on_pass_end("insert_explicit_load_store");
+@@ -118,18 +183,13 @@ pub fn to_llvm_module<'input>(
+     on_pass_end("hoist_globals");
+     let fp_mode = get_fp_mode(&directives[..]);
+     on_pass_end("get_fp_mode");
+-    let context = llvm_zluda::utils::Context::new();
+-    let llvm_ir = llvm::emit::run(&context, flat_resolver, directives, fp_mode)?;
+-    let attributes_ir = llvm::attributes::run(&context, attributes)?;
++    let llvm_ir = llvm::emit::run(context, flat_resolver, directives, fp_mode, for_linking)?;
+     on_pass_end("emit_llvm");
+-    Ok(Module {
++    Ok((
+         llvm_ir,
+-        attributes_ir,
+-        context,
+-        metadata: kernel_metadata::ModuleMetadataV1::new(sm_version),
+         metadata32,
+-        constrained_fp: fp_mode == llvm::emit::FloatingPointMode::Constrained,
+-    })
++        fp_mode == llvm::emit::FloatingPointMode::Constrained,
++    ))
+ }
+ 
+ fn get_fp_mode(
+diff --git a/ptx/src/pass/remove_unreachable_basic_blocks.rs b/ptx/src/pass/remove_unreachable_basic_blocks.rs
+index 75f93ce..9bf3485 100644
+--- a/ptx/src/pass/remove_unreachable_basic_blocks.rs
++++ b/ptx/src/pass/remove_unreachable_basic_blocks.rs
+@@ -8,6 +8,7 @@ use rustc_hash::FxHashSet;
+ 
+ pub(crate) fn run(
+     mut directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
++    for_linking: bool,
+ ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
+     let mut reachable_funcs = FxHashSet::default();
+     for directive in directives.iter_mut() {
+@@ -75,9 +76,19 @@ pub(crate) fn run(
+             Directive2::Variable(..) => true,
+             Directive2::Method(Function {
+                 name,
++                body,
++                linkage,
+                 kernel_attributes,
+                 ..
+-            }) => kernel_attributes.is_some() || reachable_funcs.contains(name),
++            }) => {
++                kernel_attributes.is_some()
++                    || reachable_funcs.contains(name)
++                    || (for_linking
++                        && body.is_some()
++                        && linkage.intersects(
++                            ast::LinkingDirective::VISIBLE | ast::LinkingDirective::WEAK,
++                        ))
++            }
+         })
+         .collect::<Vec<_>>())
+ }
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index d3a895b..aaa5cda 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -168,101 +168,106 @@ fn get_best_ptx_and_compile(
+     global_state: &GlobalState,
+     image: CodeLibraryRef<'_>,
+ ) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
+-    let mut ptx_modules = Vec::new();
++    let mut ptx_members = Vec::new();
+     unsafe {
+-        CodeLibraryRef::iterate_modules(image, |_, module| match module {
+-            Ok(CodeModuleRef::Text(ptx)) => {
+-                ptx_modules.push(Cow::Borrowed(ptx));
+-            }
+-            Ok(CodeModuleRef::File(file)) => {
+-                if file.header.kind != FatbinFileHeader::HEADER_KIND_PTX {
+-                    return;
+-                }
+-                if let Ok(text) = file.get_or_decompress_content(true) {
+-                    if let Some(text) = cow_bytes_to_str(text) {
+-                        ptx_modules.push(text);
+-                    }
++        CodeLibraryRef::iterate_modules(image, |index, module| {
++            let member = match index {
++                Some((member, Some(_))) => member,
++                _ => 0,
++            };
++            let text = match module {
++                Ok(CodeModuleRef::Text(ptx)) => Some(Cow::Borrowed(ptx)),
++                Ok(CodeModuleRef::File(file))
++                    if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX =>
++                {
++                    file.get_or_decompress_content(true)
++                        .ok()
++                        .and_then(cow_bytes_to_str)
+                 }
++                _ => None,
++            };
++            if let Some(text) = text {
++                ptx_members.resize_with(ptx_members.len().max(member + 1), Vec::new);
++                ptx_members[member].push(text);
+             }
+-            _ => {}
+         })
+     };
+-    let maybe_module = ptx_modules
++    let (sources, modules): (Vec<_>, Vec<_>) = ptx_members
+         .iter()
+-        .rev() // TODO: actually sort by SM
+-        .try_fold(
+-            None,
+-            |acc: Option<(&Cow<'_, str>, ptx_parser::Module<'_>)>, src| {
+-                let maybe_ast = if cfg!(debug_assertions) {
+-                    ptx_parser::parse_module_checked(src)
+-                } else {
+-                    Ok(ptx_parser::parse_module_unchecked(src))
+-                };
+-                match maybe_ast {
+-                    Err(_) => ControlFlow::Continue(acc),
+-                    Ok(ast) => {
+-                        if ast.invalid_directives == 0 {
+-                            return ControlFlow::Break((src, ast));
+-                        } else {
+-                            ControlFlow::Continue(Some(match acc {
+-                                Some(best_known) => {
+-                                    if ast.invalid_directives < best_known.1.invalid_directives {
+-                                        (src, ast)
+-                                    } else {
+-                                        best_known
+-                                    }
+-                                }
+-                                None => (src, ast),
+-                            }))
+-                        }
+-                    }
+-                }
+-            },
+-        );
+-    let (text, module) = match maybe_module {
+-        ControlFlow::Break((ast, module)) | ControlFlow::Continue(Some((ast, module))) => {
+-            (Some(ast), module)
+-        }
+-        ControlFlow::Continue(None) => {
+-            if cfg!(debug_assertions) {
+-                return Err(CUerror::NO_BINARY_FOR_GPU);
+-            }
+-            (
+-                None,
+-                ptx_parser::Module {
+-                    ptx_version: (1, 0),
+-                    sm_version: 0,
+-                    directives: Vec::new(),
+-                    invalid_directives: usize::MAX,
+-                    address_size: 64,
+-                },
+-            )
+-        }
+-    };
+-    // TODO: get this information on initialization
++        .filter_map(|variants| best_ptx(variants))
++        .unzip();
++    if modules.is_empty() && cfg!(debug_assertions) {
++        return Err(CUerror::NO_BINARY_FOR_GPU);
++    }
+     let hip_properties = get_hip_properties()?;
+     let gcn_arch = get_gcn_arch(&hip_properties)?;
+     let attributes = ExtraCacheAttributes {
+         clock_rate: hip_properties.clockRate as u32,
+         is_debug: cfg!(debug_assertions),
+     };
+-    let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
+-        (Some(text), Some(p)) => (|| {
+-            let cache = zluda_cache::ModuleCache::open(p)?;
+-            let key = get_cache_key(gcn_arch, &text, &attributes)?;
+-            Some((cache, key))
+-        })(),
+-        _ => None,
++    let mut cache_with_key = global_state.cache_path.as_ref().and_then(|path| {
++        let hash = match sources.as_slice() {
++            [] => return None,
++            [source] => blake3::hash(source.as_bytes()),
++            sources => {
++                let mut hash = blake3::Hasher::new_derive_key("ZLUDA linked PTX members");
++                for source in sources {
++                    hash.update(&(source.len() as u64).to_le_bytes());
++                    hash.update(source.as_bytes());
++                }
++                hash.finalize()
++            }
++        };
++        let cache = zluda_cache::ModuleCache::open(path)?;
++        let key = get_cache_key(gcn_arch, hash, &attributes)?;
++        Some((cache, key))
++    });
++    let (elf_module, sm_version, zluda32) = match load_cached_binary(&mut cache_with_key) {
++        Some(binary) => binary,
++        None => compile_and_cache(gcn_arch, attributes, modules, &mut cache_with_key)?,
+     };
+-    let cached_binary = load_cached_binary(&mut cache_with_key);
+-    let (elf_module, sm_version, zluda32) = cached_binary
+-        .ok_or(CUerror::UNKNOWN)
+-        .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))?;
+     let mut hip_module = unsafe { mem::zeroed() };
+     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
+     Ok((hip_module, sm_version, zluda32))
+ }
+ 
++fn best_ptx<'a>(variants: &'a [Cow<'_, str>]) -> Option<(&'a str, ptx_parser::Module<'a>)> {
++    let maybe_module = variants
++        .iter()
++        .rev() // TODO: actually sort by SM
++        .map(Cow::as_ref)
++        .try_fold(None, |acc: Option<(&str, ptx_parser::Module<'_>)>, src| {
++            let maybe_ast = if cfg!(debug_assertions) {
++                ptx_parser::parse_module_checked(src)
++            } else {
++                Ok(ptx_parser::parse_module_unchecked(src))
++            };
++            match maybe_ast {
++                Err(_) => ControlFlow::Continue(acc),
++                Ok(ast) => {
++                    if ast.invalid_directives == 0 {
++                        return ControlFlow::Break((src, ast));
++                    } else {
++                        ControlFlow::Continue(Some(match acc {
++                            Some(best_known) => {
++                                if ast.invalid_directives < best_known.1.invalid_directives {
++                                    (src, ast)
++                                } else {
++                                    best_known
++                                }
++                            }
++                            None => (src, ast),
++                        }))
++                    }
++                }
++            }
++        });
++    match maybe_module {
++        ControlFlow::Break(module) => Some(module),
++        ControlFlow::Continue(module) => module,
++    }
++}
++
+ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
+     match data {
+         Cow::Borrowed(bytes) => std::str::from_utf8(bytes).map(Cow::Borrowed).ok(),
+@@ -297,7 +302,7 @@ fn get_gcn_arch<'a>(props: &'a hipDeviceProp_tR0600) -> Result<&'a str, CUerror>
+ 
+ fn get_cache_key<'a, 'b>(
+     isa: &'a str,
+-    text: &str,
++    hash: blake3::Hash,
+     attributes: &impl serde::Serialize,
+ ) -> Option<zluda_cache::ModuleKey<'a>> {
+     // Serialization here is deterministic. When marking a type with
+@@ -307,7 +312,7 @@ fn get_cache_key<'a, 'b>(
+     // to rely on it
+     let serialized_attributes = serde_json::to_string(attributes).ok()?;
+     Some(zluda_cache::ModuleKey {
+-        hash: blake3::hash(text.as_bytes()).to_hex(),
++        hash: hash.to_hex(),
+         compiler_version: "builtin",
+         zluda_version: env!("VERGEN_GIT_SHA"),
+         device: isa,
+@@ -333,17 +338,27 @@ fn load_cached_binary(
+ fn compile_and_cache(
+     gcn_arch: &str,
+     attributes: ExtraCacheAttributes,
+-    ast: ptx_parser::Module,
++    mut modules: Vec<ptx_parser::Module>,
+     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
+ ) -> Result<(Vec<u8>, u32, Option<Metadata32Bit>), CUerror> {
+-    let llvm_module = ptx::to_llvm_module(
+-        ast,
+-        ptx::Attributes {
+-            clock_rate: attributes.clock_rate,
+-        },
+-        |_| {},
+-    )
+-    .map_err(|_| CUerror::UNKNOWN)?;
++    let attributes = ptx::Attributes {
++        clock_rate: attributes.clock_rate,
++    };
++    let llvm_module = if modules.len() > 1 {
++        ptx::link_ptx_modules(modules, attributes)
++    } else {
++        ptx::to_llvm_module(
++            modules.pop().unwrap_or_else(ptx_parser::Module::empty),
++            attributes,
++            |_| {},
++        )
++    }
++    .map_err(|error| {
++        if std::env::var_os("ZLUDA_LOG_DIR").is_some() {
++            eprintln!("ZLUDA PTX translation failed: {error}");
++        }
++        CUerror::UNKNOWN
++    })?;
+     let ptx_impl = llvm_module.linked_bitcode();
+     let sm_version = llvm_module.metadata.sm_version;
+     let metadata32 = llvm_module.metadata32.as_ref().map(Metadata32Bit::new);
+@@ -357,7 +372,12 @@ fn compile_and_cache(
+         llvm_module.metadata32,
+         None,
+     )
+-    .map_err(|_| CUerror::UNKNOWN)?;
++    .map_err(|error| {
++        if std::env::var_os("ZLUDA_LOG_DIR").is_some() {
++            eprintln!("ZLUDA GPU compilation failed: {error}");
++        }
++        CUerror::UNKNOWN
++    })?;
+     if let Some((cache, key)) = cache_with_key {
+         key.last_access = zluda_cache::ModuleCache::time_now();
+         cache.insert_module(key, &elf_module);
+diff --git a/ptx/src/pass/llvm/emit.rs b/ptx/src/pass/llvm/emit.rs
+index 079a801..a8eba31 100644
+--- a/ptx/src/pass/llvm/emit.rs
++++ b/ptx/src/pass/llvm/emit.rs
+@@ -67,13 +67,16 @@ pub(crate) fn run<'input>(
+     id_defs: GlobalStringIdentResolver2<'input>,
+     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+     fp_mode: FloatingPointMode,
++    for_linking: bool,
+ ) -> Result<llvm::Module, TranslateError> {
+     let module = llvm::Module::new(context, LLVM_UNNAMED);
+     let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode);
+     for directive in directives {
+         match directive {
+-            Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
+-            Directive2::Method(method) => emit_ctx.emit_method(method)?,
++            Directive2::Variable(linking, variable) => {
++                emit_ctx.emit_global(linking, variable, for_linking)?
++            }
++            Directive2::Method(method) => emit_ctx.emit_method(method, for_linking)?,
+         }
+     }
+     if cfg!(debug_assertions) {
+@@ -121,6 +124,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+     fn emit_method(
+         &mut self,
+         method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
++        for_linking: bool,
+     ) -> Result<(), TranslateError> {
+         let name = method
+             .import_as
+@@ -190,6 +194,15 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+             }
+         }
+         let is_kernel = method.is_kernel();
++        if for_linking && method.body.is_some() {
++            unsafe {
++                if method.linkage.contains(ast::LinkingDirective::WEAK) {
++                    LLVMSetLinkage(fn_, LLVMLinkage::LLVMWeakAnyLinkage);
++                } else if !is_kernel && method.linkage.is_empty() {
++                    LLVMSetLinkage(fn_, LLVMLinkage::LLVMInternalLinkage);
++                }
++            }
++        }
+         if !is_kernel {
+             unsafe {
+                 LLVMSetVisibility(fn_, llvm_zluda::LLVMVisibility::LLVMHiddenVisibility);
+@@ -247,8 +260,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+ 
+     fn emit_global(
+         &mut self,
+-        _linking: ast::LinkingDirective,
++        linking: ast::LinkingDirective,
+         var: ast::Variable<SpirvWord>,
++        for_linking: bool,
+     ) -> Result<(), TranslateError> {
+         let name = self
+             .id_defs
+@@ -288,6 +302,24 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
+             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
+             unsafe { LLVMSetInitializer(global, initializer) };
+         }
++        if for_linking && !linking.contains(ast::LinkingDirective::EXTERN) {
++            unsafe {
++                if LLVMGetInitializer(global).is_null() {
++                    let initializer = match var.info.state_space {
++                        ast::StateSpace::Shared
++                        | ast::StateSpace::SharedCta
++                        | ast::StateSpace::SharedCluster => LLVMGetUndef(llvm_type),
++                        _ => LLVMConstNull(llvm_type),
++                    };
++                    LLVMSetInitializer(global, initializer);
++                }
++                if linking.contains(ast::LinkingDirective::WEAK) {
++                    LLVMSetLinkage(global, LLVMLinkage::LLVMWeakAnyLinkage);
++                } else if linking.is_empty() {
++                    LLVMSetLinkage(global, LLVMLinkage::LLVMInternalLinkage);
++                }
++            }
++        }
+         Ok(())
+     }
+ 

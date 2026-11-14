@@ -1,0 +1,55 @@
+diff --git a/llvm_zluda/build.rs b/llvm_zluda/build.rs
+index 8db3551..3b72125 100644
+--- a/llvm_zluda/build.rs
++++ b/llvm_zluda/build.rs
+@@ -37,6 +37,7 @@ fn main() {
+         .define("LLVM_ENABLE_LIBPFM", "OFF")
+         .define("LLVM_ENABLE_ZLIB", "OFF")
+         .define("LLVM_ENABLE_ZSTD", "OFF")
++        .define("LLVM_ENABLE_DIA_SDK", "OFF")
+         .define("LLVM_INCLUDE_BENCHMARKS", "OFF")
+         .define("LLVM_INCLUDE_EXAMPLES", "OFF")
+         .define("LLVM_INCLUDE_TESTS", "OFF")
+@@ -117,15 +118,13 @@ fn try_use_ninja(cmake: &mut Config) {
+ // We resort to this garbage because Cargo is ideologically opposed to
+ // being useful, see here: https://github.com/rust-lang/cargo/issues/11054
+ fn try_get_build_profile_name() -> String {
+-    let mut path = PathBuf::from(env::var("OUT_DIR").unwrap());
+-    path.pop();
+-    path.pop();
+-    path.pop();
+-    let name = path.file_name().unwrap().to_str().unwrap();
+-    if !["debug", "dev-llvm", "release", "release-lto"].contains(&name) {
+-        panic!("Unknown build profile: {}", name);
+-    }
+-    name.to_string()
++    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
++    output
++        .ancestors()
++        .filter_map(|path| path.file_name()?.to_str())
++        .find(|name| ["debug", "dev-llvm", "release", "release-lto"].contains(name))
++        .expect("OUT_DIR does not contain a known Cargo profile")
++        .to_owned()
+ }
+ 
+ fn get_llvm_build_path(llvm_build_dir: &PathBuf, cmake_profile: &str) -> PathBuf {
+@@ -189,7 +188,18 @@ fn llvm_config(llvm_config_path: &PathBuf) -> io::Result<(String, String, String
+ 
+ fn compile_cxx_lib(cxxflags: String, llvm_build_path: &PathBuf) {
+     let mut cc = cc::Build::new();
+-    for flag in cxxflags.split_whitespace() {
++    // llvm-config prints unquoted include paths on Windows.
++    let mut flags = cxxflags.split_whitespace().peekable();
++    while let Some(flag) = flags.next() {
++        if let Some(path) = flag.strip_prefix("-I") {
++            let mut include = path.to_owned();
++            while let Some(part) = flags.next_if(|part| !part.starts_with(['-', '/'])) {
++                include.push(' ');
++                include.push_str(part);
++            }
++            cc.include(include);
++            continue;
++        }
+         cc.flag(flag);
+     }
+ 

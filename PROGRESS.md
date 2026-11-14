@@ -72,3 +72,30 @@ been validated.
 The current release remains suitable for the synthetic compute baseline.
 Use the regular Revo Metro shortcut and CPU mode for scanning while
 the two CUDA gaps are being addressed.
+
+### Patched driver ready for a scanner retest
+
+- Built the patched Windows CUDA driver and CUDA Driver API tracer using
+  workspace-local Rust 1.100.0 and the pinned ZLUDA, LLVM, and HiGHS sources.
+  The four patches reproduced the build source when applied to clean
+  upstream files.
+- The driver selects one PTX variant per fatbin member and links the
+  lowered members together. The implementation covers 64-bit PTX
+  libraries. The existing single-image path also remains available for
+  32-bit PTX.
+- All 25 PTX parser tests passed. On the RX 7900 XT, the patched build
+  passed the vector, cuFFT 11, and shared/global atomic-add probes.
+  The two-member regression found both kernels, resolved a repeated
+  weak kernel, and ran a cross-member device call that returned 79.
+  The same regression passed through the rebuilt tracer and produced
+  separate PTX files for both members.
+- A local read-only probe loaded the six CUDA images from
+  Revo Metro 5.8.8.460's installed GPU algorithm DLL through the CUDA
+  library API. Both the CUB EmptyKernel and the previously missing
+  Thrust uninitialized-fill kernel resolved with the patched DLL. The
+  probe lives in ignored build artifacts and reads the vendor DLL in
+  place.
+- The verified package is `artifacts/zluda-patched-20261113-213650-891`.
+  Launch it via `Start-RevoTrace.ps1 -ZludaDir` and repeat the same
+  new-project Save and scanner-start sequence. Physical scanning,
+  tracking, and accuracy remain to be tested.

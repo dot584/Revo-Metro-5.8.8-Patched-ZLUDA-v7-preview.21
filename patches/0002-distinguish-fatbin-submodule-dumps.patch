@@ -1,6 +1,8 @@
+diff --git a/zluda_common/src/lib.rs b/zluda_common/src/lib.rs
+index 4332757..ec2d9d2 100644
 --- a/zluda_common/src/lib.rs
 +++ b/zluda_common/src/lib.rs
-@@ -1223,29 +1223,21 @@
+@@ -1223,29 +1223,21 @@ impl<'a> CodeLibraryRef<'a> {
                  let module_iter = fatbin.get_submodules();
                  match module_iter {
                      Ok(mut iter) => {

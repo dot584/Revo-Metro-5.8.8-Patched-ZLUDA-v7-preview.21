@@ -108,3 +108,29 @@ The [upstream build instructions](https://zluda.readthedocs.io/latest/building.h
 use `cargo xtask --release`. The two pinned submodules supply LLVM and
 HiGHS. The release archive is the reference until a source build has been
 tested against the same probe.
+
+## Patched Windows driver
+
+The patched driver build uses the x64 MSVC tools and Rust under
+`artifacts/toolchain`. To provision Rust locally, use the official x64
+Windows `rustup-init.exe` with `RUSTUP_HOME` and `CARGO_HOME` pointing to
+`artifacts/toolchain/rustup` and `artifacts/toolchain/cargo`. Pass
+`--no-modify-path --profile minimal`. Fetch the pinned Git LFS and
+submodule contents before the first build.
+
+Apply the patch series in numeric order to the pinned checkout. Build
+with PowerShell 7 and stage a separate copy of the verified release
+package with the rebuilt CUDA driver and trace DLLs.
+
+```powershell
+./build/Build-PatchedDriver.ps1
+$patched = ./build/Stage-PatchedDriver.ps1
+python ./tests/gpu_smoke.py $patched --atomic-reduction ./tests/atomic_reduction.ptx
+python ./tests/fatbin_lookup.py $patched
+```
+
+The fatbin test checks lookup across two members, a repeated weak
+kernel, and an actual cross-image device call. After both probes pass,
+use `./diagnostics/Start-RevoTrace.ps1 -ZludaDir $patched` for the scanner
+retest. The launcher uses the installed Revo Metro executable and the
+DLLs in the staged project package.
