@@ -1,0 +1,36 @@
+--- a/zluda_common/src/lib.rs
++++ b/zluda_common/src/lib.rs
+@@ -1223,29 +1223,21 @@
+                 let module_iter = fatbin.get_submodules();
+                 match module_iter {
+                     Ok(mut iter) => {
+-                        let mut module_index = if iter.multi_module() {
+-                            None
+-                        } else {
+-                            Some(0usize)
+-                        };
++                        let mut module_index = 0;
+                         while let Some(maybe_submodule) = iter.next() {
+                             match maybe_submodule {
+                                 Ok(submodule) => iterate_modules_fatbin_header(
+                                     |subindex, module| {
+-                                        let index = match module_index {
+-                                            Some(index) => (index, Some(subindex)),
+-                                            None => (subindex, None),
+-                                        };
+-                                        fn_(Some(index), module)
++                                        fn_(Some((module_index, Some(subindex))), module)
+                                     },
+                                     submodule,
+                                 ),
+                                 Err(err) => fn_(
+-                                    module_index.map(|module_index| (module_index, None)),
++                                    Some((module_index, None)),
+                                     Err(FatbinError::ParseFailure(err)),
+                                 ),
+                             }
+-                            module_index = module_index.map(|index| index + 1);
++                            module_index += 1;
+                         }
+                     }
+                     Err(err) => fn_(None, Err(err)),

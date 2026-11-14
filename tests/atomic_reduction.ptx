@@ -1,0 +1,27 @@
+.version 8.4
+.target sm_86
+.address_size 64
+
+.visible .entry atomic_reduction(.param .u64 output_ptr)
+{
+    .shared .align 4 .u32 total;
+    .reg .pred %first;
+    .reg .u32 %thread, %address, %value;
+    .reg .u64 %output;
+
+    mov.u32 %thread, %tid.x;
+    mov.u32 %address, total;
+    setp.eq.u32 %first, %thread, 0;
+    @%first st.shared.u32 [%address], 0;
+    bar.sync 0;
+
+    add.u32 %value, %thread, 1;
+    red.shared.add.u32 [%address], %value;
+    bar.sync 0;
+
+    ld.param.u64 %output, [output_ptr];
+    cvta.to.global.u64 %output, %output;
+    @%first ld.shared.u32 %value, [%address];
+    @%first red.global.add.u32 [%output], %value;
+    ret;
+}

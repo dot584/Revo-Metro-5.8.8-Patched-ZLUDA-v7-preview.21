@@ -126,11 +126,40 @@ def test_fft(driver, fft):
     print(f"PASS: cuFFT 11 matched all {rows * columns} complex values", flush=True)
 
 
+def test_atomic_reduction(driver, ptx_path):
+    blocks, threads = 8, 64
+    expected = blocks * threads * (threads + 1) // 2
+    with ExitStack() as cleanup:
+        module = PTR()
+        checked(driver, "cuModuleLoadData", c.POINTER(PTR), c.c_char_p)(
+            c.byref(module), ptx_path.read_bytes()
+        )
+        cleanup.callback(checked(driver, "cuModuleUnload", PTR), module)
+        kernel = PTR()
+        checked(driver, "cuModuleGetFunction", c.POINTER(PTR), PTR, c.c_char_p)(
+            c.byref(kernel), module, b"atomic_reduction"
+        )
+        result = UINT()
+        size = c.sizeof(result)
+        output = allocate(driver, cleanup, size)
+        checked(driver, "cuMemcpyHtoD_v2", DEVICE_PTR, PTR, SIZE)(output, c.byref(result), size)
+        args = (PTR * 1)(c.addressof(output))
+        checked(driver, "cuLaunchKernel", PTR, *(UINT,) * 7, PTR, c.POINTER(PTR), PTR)(
+            kernel, blocks, 1, 1, threads, 1, 1, 0, None, args, None
+        )
+        checked(driver, "cuCtxSynchronize")()
+        checked(driver, "cuMemcpyDtoH_v2", PTR, DEVICE_PTR, SIZE)(c.byref(result), output, size)
+        if result.value != expected:
+            raise RuntimeError(f"Atomic reduction: got {result.value}, expected {expected}")
+    print(f"PASS: shared and global atomic reduction returned {expected}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zluda_dir", type=Path)
     parser.add_argument("--fft-dir", type=Path, help="Use cuFFT from a different ZLUDA directory")
     parser.add_argument("--device", default="Radeon RX 7900 XT")
+    parser.add_argument("--atomic-reduction", type=Path, help="Run the atomic reduction test PTX")
     args = parser.parse_args()
     if sys.platform != "win32" or c.sizeof(PTR) != 8:
         parser.error("64-bit Python on Windows is required")
@@ -142,6 +171,8 @@ def main():
         cuda_context(driver, cleanup, args.device)
         test_ptx(driver)
         test_fft(driver, c.WinDLL(str(fft_directory / "cufft64_11.dll")))
+        if args.atomic_reduction:
+            test_atomic_reduction(driver, args.atomic_reduction)
 
 
 if __name__ == "__main__":

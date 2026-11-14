@@ -43,3 +43,32 @@ capture the CUDA Driver API trace if the GPU scan fails. Use
 [the scanner workflow](docs/WORKFLOW.md#scanner-runs). No scanner mode,
 tracking, point-cloud performance, or dimensional-accuracy claim has
 been validated.
+
+### First scanner crash
+
+- Revo Metro 5.8.8.460 opened with the CUDA Driver API trace. The process
+  loaded the workspace's ZLUDA driver and cuFFT 11. Clicking Save on a
+  new scan project triggered scanning startup and exit `0xC0000005`.
+  The last failed call was `cuModuleGetFunction` for a Thrust
+  `uninitialized_fill` kernel, with `CUDA_ERROR_NOT_FOUND`.
+- ZLUDA flattens architecture variants from all members of a version 2
+  fatbin wrapper and compiles a single PTX image. Read-only inspection
+  found the requested kernel in a different PTX image in the installed
+  GPU algorithm DLL. A synthetic two-image CUDA library on the RX 7900
+  XT exposed only the second kernel, while both kernels were found
+  when loaded as standalone images. Implement selection per fatbin
+  member and preserve cross-member symbol resolution before retesting.
+- The same capture showed parse failures for scalar unsigned atomic
+  reductions (`red.shared.add.u32` and `red.global.add.u32`) in another
+  image. A synthetic probe reproduced the missing-kernel result.
+  The equivalent returning `atom.add.u32` form passed on the RX 7900 XT
+  with the expected total of 16,640. Added a candidate ZLUDA parser and
+  lowering patch for those instructions.
+- The tracer attempted to write different fatbin members to identical
+  filenames. Added a candidate patch to number members and their images
+  independently. Both patches apply cleanly at the upstream pin.
+  Patched builds and scanner retest are pending.
+
+The current release remains suitable for the synthetic compute baseline.
+Use the regular Revo Metro shortcut and CPU mode for scanning while
+the two CUDA gaps are being addressed.
