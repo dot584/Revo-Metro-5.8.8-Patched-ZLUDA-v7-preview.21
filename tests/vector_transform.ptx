@@ -1,0 +1,36 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry vector_transform(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 length
+)
+{
+    .reg .pred %outside;
+    .reg .u32 %block, %block_size, %thread, %index, %length, %value;
+    .reg .u64 %input, %output, %offset;
+
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %block_size, %ntid.x;
+    mov.u32 %thread, %tid.x;
+    mad.lo.u32 %index, %block, %block_size, %thread;
+    ld.param.u32 %length, [length];
+    setp.ge.u32 %outside, %index, %length;
+    @%outside bra done;
+
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    cvta.to.global.u64 %input, %input;
+    cvta.to.global.u64 %output, %output;
+    mul.wide.u32 %offset, %index, 4;
+    add.u64 %input, %input, %offset;
+    add.u64 %output, %output, %offset;
+    ld.global.u32 %value, [%input];
+    mad.lo.u32 %value, %value, 3, %index;
+    st.global.u32 [%output], %value;
+
+done:
+    ret;
+}

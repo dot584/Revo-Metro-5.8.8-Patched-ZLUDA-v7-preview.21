@@ -1,0 +1,42 @@
+# Revo Metro AMD compatibility progress
+
+## November 13, 2026
+
+- Confirmed Windows 11 Home 26H2 (26300.9974), Ryzen 7 5800X3D, about
+  32 GiB RAM, and AMD Radeon RX 7900 XT. AMD Software is 26.10.1 and
+  the active display driver is 32.0.32015.7029. HIP `hipInfo` reports
+  `gfx1100` and 19.98 GB VRAM. The exact scanner model awaits physical
+  confirmation.
+- Confirmed Revo Metro 5.8.8.460 from its executable and uninstall entry.
+  Static PE import inspection found `RPAGPUAlgorithm.dll` imports CUDA
+  Runtime 12 and cuFFT 11 (`cufftPlan2d`, `cufftExecC2C`, `cufftDestroy`).
+  `RPAParallel.dll` also imports CUDA Runtime 12. Runtime library loads
+  and the application's behavior at marker detection still need a trace.
+- Pinned official ZLUDA v7-preview.21, also upstream master at
+  `eb89ae3b23b2abaf8480e496fdd5d51f0651d330`. GitHub lists v6 as the
+  latest stable release. Preserved the MIT and Apache 2.0 notices in the
+  independent upstream Git checkout. Verified the official Windows ZIP
+  against its GitHub SHA-256.
+- Installed tools include Git 2.49, Python 3.12.7, Visual Studio Build
+  Tools 2022, MSVC 14.43, and bundled CMake 3.30.5 and Ninja. The source
+  build preflight stopped at missing Cargo. LLVM and HiGHS submodules
+  are still pending. This baseline uses the official binary release.
+- `cuda_check.exe` reported CUDA and cuFFT 11 initialized using AMD HIP
+  SDK 6.2 libraries. cuBLAS, cuBLASLt, and cuDNN initialization failed.
+  The NVAPI entry reported that its check is unimplemented. None of
+  those failed libraries appeared in Revo Metro's static CUDA imports.
+- Synthetic CUDA Driver API PTX compute passed on the RX 7900 XT,
+  matching 257/257 expected integers. An out-of-place complex 2D forward
+  cuFFT transform passed 32/32 outputs within absolute error 1e-5.
+- Full ZLUDA tracing passed PTX but panicked after `cufftPlan2d` when
+  calling `cufftExecC2C` (`RefCell already borrowed`,
+  `zluda_trace/src/lib.rs:1015`). With CUDA Driver API-only tracing and
+  regular ZLUDA cuFFT, both tests passed and the trace recorded the PTX
+  load, launch, completion, and device-to-host copy. This is a synthetic
+  tracing bug. The Revo Metro marker failure still needs reproduction.
+
+Next action is to run matching CPU and untraced GPU laser scans and
+capture the CUDA Driver API trace if the GPU scan fails. Use
+[the scanner workflow](docs/WORKFLOW.md#scanner-runs). No scanner mode,
+tracking, point-cloud performance, or dimensional-accuracy claim has
+been validated.
